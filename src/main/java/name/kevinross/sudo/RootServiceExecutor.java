@@ -1,8 +1,7 @@
 package name.kevinross.sudo;
 
-import android.app.Application;
-import android.app.Service;
 import android.content.Context;
+import android.content.Intent;
 import android.content.pm.PackageManager;
 import android.os.Binder;
 import android.os.IBinder;
@@ -10,13 +9,11 @@ import android.os.IInterface;
 import android.os.Parcel;
 import android.os.RemoteException;
 import android.os.ServiceManager;
-import android.util.Log;
 
 import java.lang.reflect.InvocationHandler;
 import java.lang.reflect.Method;
 import java.lang.reflect.Proxy;
-import java.util.ArrayList;
-import java.util.List;
+import java.util.concurrent.locks.ReentrantLock;
 
 import joptsimple.OptionParser;
 import joptsimple.OptionSet;
@@ -30,7 +27,8 @@ public class RootServiceExecutor extends AbstractTool {
     private int hostUid = -1;
     private boolean allowOthers = false;
     private boolean keepAlive = false;
-    private Binder token = null;
+    private IBinder token = null;
+    private ReentrantLock dieLock = new ReentrantLock();
     public RootServiceExecutor() {
 
     }
@@ -60,6 +58,26 @@ public class RootServiceExecutor extends AbstractTool {
         }
         return null;
     }
+    private void die() {
+        if (keepAlive) {
+            return;
+        }
+        if (dieLock.isLocked()) {
+            return;
+        }
+        dieLock.lock();
+        new Thread(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    Thread.sleep(100);
+                } catch (Exception e) {
+
+                }
+                System.exit(0);
+            }
+        }).start();
+    }
     private void registerControl(String pkg, Class<IInterface> parent) {
         setDescriptor(IRemoteService.class, getDescriptor(parent) + ".Control");
         hostUid = getPackageContext(pkg).getApplicationInfo().uid;
@@ -70,21 +88,18 @@ public class RootServiceExecutor extends AbstractTool {
                     throw new RuntimeException("Caller not from proper package");
                 }
                 // when the host app goes, we might go with it
-                RootServiceExecutor.this.token = (Binder) token;
+                RootServiceExecutor.this.token = (IBinder) token;
                 RootServiceExecutor.this.token.linkToDeath(new DeathRecipient() {
                     @Override
                     public void binderDied() {
-                        if (keepAlive) {
-                            return;
-                        }
-                        System.exit(0);
+                        die();
                     }
                 }, 0);
             }
 
             @Override
             public void killService() throws RemoteException {
-                System.exit(0);
+                die();
             }
         };
         ServiceManager.addService(getDescriptor(IRemoteService.class), mRemote.asBinder());
@@ -97,7 +112,6 @@ public class RootServiceExecutor extends AbstractTool {
                     throw new RemoteException(String.format("Not called by app in package: Calling=%d, Package=%d", Binder.getCallingUid(), hostUid));
                 }
                 return method.invoke(parent, args);
-                //return ReflectionUtil.invokes().on(parent).name(method.getName()).of(ReflectionUtil.paramsToTypes(args)).using(args).swallow().invoke();
             }
         });
     }
@@ -111,14 +125,18 @@ public class RootServiceExecutor extends AbstractTool {
         // the class to use as the service
         String serviceName = parser.valueOf("s").toString();
         Class<RootService> serviceClass = ReflectionUtil.getClassByName(apkClassLoader, serviceName);
-        Object service = ReflectionUtil.invokes().on(serviceClass).of(String.class).using("").swallow().getNewInstance();
+        Object service = ReflectionUtil.invokes().on(serviceClass).swallow().getNewInstance();
         // permissions
         allowOthers = ReflectionUtil.invokes().on(service).name("allowOthers").nosy().swallow().invoke();
         // lifecycle
         keepAlive = ReflectionUtil.invokes().on(service).name("keepAlive").nosy().swallow().invoke();
         // the interface to provide
-        Class<IInterface> interfaceClass = ReflectionUtil.invokes().on(service).name("getInterfaceClass").swallow().invoke();
-        Binder binimpl = ReflectionUtil.invokes().on(service).name("getImplementation").swallow().invoke();
+        Intent superIntent = new Intent(pkgContext, serviceClass);
+        superIntent.putExtra(RootService.RUNNING_IN_ROOT, true);
+        Binder binimpl = ReflectionUtil.invokes().on(service).name("onBind").of(Intent.class).using(superIntent).swallow().invoke();
+
+        Class<IInterface> interfaceClass = (Class<IInterface>)binimpl.getClass().getSuperclass().getInterfaces()[0];
+
         registerControl(parser.valueOf("p").toString(), interfaceClass);
 
         // register the service and use the implementation provided by the RootService subclass
